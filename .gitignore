@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+Cargo.lock
+
+*.env
+*.conf
+*.yaml
+*.yml
+*.toml
+
+# --- OS specific ---
+.DS_Store
+Thumbs.db
