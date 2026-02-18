@@ -58,3 +58,10 @@ pub struct InfraRaw {
     pub net_in_errors: u64,
     pub net_out_errors: u64,
 }
+
+#[derive(serde::Deserialize, Debug)]
+pub struct ControlCommand {
+    pub action: String,       // "START" hoặc "STOP"
+    pub port: Option<u32>,    // Cần cho lệnh START
+    pub target: Option<String>, // Cần cho lệnh START (vd: "main.exe")
+}

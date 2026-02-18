@@ -15,7 +15,6 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32
 };
 
-// Import đúng struct Raw mới
 use crate::model::AppInternalsRaw;
 
 // #[repr(C)]
@@ -164,7 +163,7 @@ impl ProcessLock {
                 let entries = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
                 for row in entries {
                     if row.dwOwningPid == self.pid {
-                        active_connections += 1; // Chỉ tăng biến đếm, cực nhẹ
+                        active_connections += 1; // Chỉ tăng biến đếm
                     }
                 }
             }
