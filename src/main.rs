@@ -1,30 +1,35 @@
-mod model;
 mod collector;
+mod model;
 mod tracker;
+mod pdh_system;
 
-use std::{ time::Duration};
-use windows::Win32::UI::Shell::IsUserAnAdmin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
+use tokio_tungstenite::connect_async;
+
 use windows::Win32::Security::{
-    AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES,
-    TOKEN_PRIVILEGES, TOKEN_QUERY, SE_PRIVILEGE_ENABLED,
+    AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, GetExitCodeProcess};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::UI::Shell::IsUserAnAdmin;
 use windows::core::PCWSTR;
 
 use clap::{Parser, Subcommand};
-use std::process::Command;
-use futures_util::{StreamExt,SinkExt};
-use tokio_tungstenite::connect_async;
 
-// Sử dụng các công cụ đã tối ưu
-use crate::collector::{ProcessLock, ProcessFinder};
-use crate::tracker::TargetTracker;
-use crate::model::{
-    ControlCommand
-};
+use crate::model::ControlCommand;
+use crate::tracker::AgentLoop;
+
+// =============================================================================
+// CLI
+// =============================================================================
 
 #[derive(Parser)]
-#[command(name = "HarborAgent", version = "0.2.0")]
+#[command(name = "HarborAgent", version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -32,214 +37,313 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Cài đặt Agent vào Windows Service & Env
-    Install { #[arg(short, long)] url: String },
-    /// Gỡ bỏ Agent khỏi hệ thống
+    /// Cai dat Agent vao Windows Service
+    Install {
+        #[arg(short, long)]
+        url: String,
+    },
+    /// Go bo Agent khoi he thong
     Uninstall,
-    /// Chạy Agent (Dùng cho Service hoặc Debug)
+    /// Chay Agent (dung cho Service hoac debug)
     Run,
 }
 
+// =============================================================================
+// ENTRY POINT
+// =============================================================================
 
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() == 1 {
-        // Kiểm tra quyền Admin trước khi làm bất cứ việc gì
+        // Chay truc tiep khong co subcommand: huong dan setup
         if !is_admin() {
-            println!("❌ Quyền Admin là bắt buộc. Vui lòng chạy với tư cách Administrator.");
+            eprintln!("Quyen Admin la bat buoc. Vui long chay voi tu cach Administrator.");
             return;
         }
 
-        // Kiểm tra cấu hình URL
         if std::env::var("HARBOR_SERVER_URL").is_err() {
-            println!("✨ Chào mừng bạn đến với Harbor Agent!");
-            println!("---------------------------------------");
-            println!("Nhập URL của Server Go (Ví dụ: ws://127.0.0.1:8088/ws):");
-            
-            let mut input_url = String::new();
-            std::io::stdin().read_line(&mut input_url).expect("Không đọc được input");
-            let input_url = input_url.trim().to_string();
-
-            if input_url.is_empty() {
-                println!("❌ URL không được để trống.");
+            println!("Nhap URL cua Server (Vi du: ws://127.0.0.1:8088/ws):");
+            let mut url = String::new();
+            std::io::stdin().read_line(&mut url).expect("Khong doc duoc input");
+            let url = url.trim().to_string();
+            if url.is_empty() {
+                eprintln!("URL khong duoc de trong.");
                 return;
             }
-            install_agent(&input_url);
+            install_agent(&url);
         }
 
-        println!("🚀 Đang khởi động Agent ở chế độ nền...");
         run_agent_service().await;
-    } else {
-        let cli = Cli::parse();
-        match &cli.command {
-            Commands::Install { url } => install_agent(url),
-            Commands::Uninstall => uninstall_agent(),
-            Commands::Run => run_agent_service().await,
+        return;
+    }
+
+    let cli = Cli::parse();
+    match &cli.command {
+        Commands::Install { url } => install_agent(url),
+        Commands::Uninstall => uninstall_agent(),
+        Commands::Run => {
+            if !is_admin() {
+                eprintln!("Quyen Admin la bat buoc.");
+                return;
+            }
+            run_agent_service().await;
         }
     }
 }
 
+// =============================================================================
+// CORE SERVICE
+// =============================================================================
+
 async fn run_agent_service() {
-    if !is_admin() { return; }
     let _ = enable_debug_privilege();
 
     let server_url = std::env::var("HARBOR_SERVER_URL")
         .unwrap_or_else(|_| "ws://127.0.0.1:8088/ws".to_string());
 
-    let (tx_control, mut rx_control) = tokio::sync::mpsc::unbounded_channel::<Option<(u32, String)>>();
-    let (tx_data, mut rx_data) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // Channel: server -> worker (lệnh START/STOP)
+    // Option<(port, name)>: Some = START, None = STOP
+    let (tx_control, rx_control) = mpsc::unbounded_channel::<Option<(u16, String)>>();
 
-    // --- LUỒNG 1: WORKER (Giữ nguyên logic của bạn nhưng tối ưu) ---
-    let tx_data_clone = tx_data.clone();
-    tokio::spawn(async move {
-        let mut tracker = TargetTracker::new(0);
-        let mut finder = ProcessFinder::new();
-        let mut current_lock: Option<ProcessLock> = None;
-        let mut active_config: Option<(u32, String)> = None;
+    // Channel: worker -> websocket (json payload)
+    let (tx_data, rx_data) = mpsc::unbounded_channel::<String>();
 
-        loop {
-            // Kiểm tra lệnh điều khiển mới
-            while let Ok(new_cfg) = rx_control.try_recv() {
-                if new_cfg.is_none() {
-                    println!("💤 Đã nhận lệnh STOP, dừng thu thập.");
-                    current_lock = None; // Giải phóng Handle ngay lập tức
-                }
-                active_config = new_cfg;
-            }
+    // Shutdown signal dung chung giua worker va ws loop
+    let shutdown = Arc::new(AtomicBool::new(false));
 
-            if let Some((port, name)) = &active_config {
-                // Logic kiểm tra process và gửi data
-                let is_active = if let Some(ref lock) = current_lock {
-                    is_process_alive(lock.handle)
-                } else { false };
-
-                if !is_active {
-                    if let Some(pid) = finder.find_by_port_and_name(*port as u16, name) {
-                        if let Some(lock) = ProcessLock::new(pid) {
-                            tracker.handle_restart(pid);
-                            current_lock = Some(lock);
-                            println!("🎯 ĐÃ KHÓA MỤC TIÊU: {} (PID: {})", name, pid);
-                        }
-                    }
-                }
-
-                if let Some(ref lock) = current_lock {
-                    let (l2, io, conn, net) = lock.collect_all_raw();
-                    let mut payload = tracker.process_to_payload(l2, io, conn, net);
-                    payload.metadata.process_path = lock.get_path();
-                    
-                    if let Ok(json) = serde_json::to_string(&payload) {
-                        let _ = tx_data_clone.send(json);
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
+    // Spawn worker thread rieng (blocking loop, khong dung tokio thread)
+    let shutdown_worker = Arc::clone(&shutdown);
+    let tx_data_worker = tx_data.clone();
+    std::thread::spawn(move || {
+        worker_loop(rx_control, tx_data_worker, shutdown_worker);
     });
 
-    // --- LUỒNG 2: KẾT NỐI & RECONNECT ---
-    let mut sleep_dur = 10; 
-    let mut count = 0;
-    loop {
-        println!("📡 Đang kết nối tới Server: {}...", server_url);
-        match connect_async(&server_url).await {
-            Ok((ws_stream, _)) => {
-                println!("✅ Đã kết nối! Trạng thái: Idle.");
-                let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    // WS loop chay tren tokio
+    ws_loop(server_url, tx_control, rx_data, shutdown).await;
+}
 
-                loop {
-                    tokio::select! {
-                        msg = ws_receiver.next() => {
-                            match msg {
-                                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-                                    if let Ok(cmd) = serde_json::from_str::<ControlCommand>(&text) {
-                                        match cmd.action.as_str() {
-                                            "START" => {
-                                                if let (Some(p), Some(t)) = (cmd.port, cmd.target) {
-                                                    println!("🚀 START: Port {} - {}", p, t);
-                                                    let _ = tx_control.send(Some((p, t)));
-                                                }
-                                            },
-                                            "STOP" => { 
-                                                let _ = tx_control.send(None); 
-                                            },
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    println!("🔌 Mất kết nối WebSocket.");
-                                    let _ = tx_control.send(None); // Dừng worker khi mất kết nối
-                                    break; 
-                                }
-                            }
-                        }
-                        Some(json_payload) = rx_data.recv() => {
-                            let _ = ws_sender.send(tokio_tungstenite::tungstenite::Message::Text(json_payload)).await;
-                        }
-                    }
+// =============================================================================
+// WORKER LOOP - chay tren OS thread rieng, khong block tokio runtime
+// =============================================================================
+
+fn worker_loop(
+    mut rx_control: mpsc::UnboundedReceiver<Option<(u16, String)>>,
+    tx_data: mpsc::UnboundedSender<String>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let collect_interval = Duration::from_secs(5);
+
+    // Trang thai hien tai: chua co target
+    let mut agent_loop: Option<AgentLoop> = None;
+    let mut active_config: Option<(u16, String)> = None;
+
+    while !shutdown.load(Ordering::Relaxed) {
+        // --- Nhan lenh dieu khien (non-blocking drain) ---
+        while let Ok(cmd) = rx_control.try_recv() {
+            match cmd {
+                Some((port, name)) => {
+                    println!("START: port={} name={}", port, name);
+                    agent_loop = Some(AgentLoop::new(
+                        0, // PID se duoc tim qua finder
+                        name.clone(),
+                        port,
+                        collect_interval,
+                    ));
+                    active_config = Some((port, name));
                 }
-            }
-            Err(e) => {
-                if count <=60 {
-                    count += 1;
-                    sleep_dur+=10;
+                None => {
+                    println!("STOP: dung thu thap.");
+                    agent_loop = None;
+                    active_config = None;
                 }
-                eprintln!("❌ Lỗi kết nối: {}. Thử lại sau {sleep_dur}s...", e);
             }
         }
-        
-        tokio::time::sleep(Duration::from_secs(sleep_dur)).await;
+
+        // --- Collect va gui neu dang active ---
+        if let Some(ref mut aloop) = agent_loop {
+            let shutdown_inner = Arc::new(AtomicBool::new(false));
+            let tx = tx_data.clone();
+
+            // Chay 1 iteration cua AgentLoop: collect 1 lan roi tra ve
+            aloop.run_once(|payload| {
+                match serde_json::to_string(&payload) {
+                    Ok(json) => {
+                        if tx.send(json).is_err() {
+                            // WS da dong, ghi log nhung khong crash
+                            eprintln!("WS channel closed, payload dropped.");
+                        }
+                    }
+                    Err(e) => eprintln!("Serialize error: {}", e),
+                }
+            });
+        }
+
+        std::thread::sleep(collect_interval);
     }
 }
 
-// --- QUẢN LÝ HỆ THỐNG (INSTALL / UNINSTALL) ---
-fn install_agent(url: &String) {
-    println!("📦 Đang cấu hình Harbor Agent...");
-    
-    // Ghi Registry vĩnh viễn
+// =============================================================================
+// WEBSOCKET LOOP - reconnect co backoff
+// =============================================================================
+
+async fn ws_loop(
+    server_url: String,
+    tx_control: mpsc::UnboundedSender<Option<(u16, String)>>,
+    mut rx_data: mpsc::UnboundedReceiver<String>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut backoff_secs: u64 = 2;
+    const MAX_BACKOFF: u64 = 60;
+
+    while !shutdown.load(Ordering::Relaxed) {
+        println!("Dang ket noi toi: {}", server_url);
+
+        match connect_async(&server_url).await {
+            Ok((ws_stream, _)) => {
+                println!("Ket noi thanh cong.");
+                backoff_secs = 2; // reset backoff khi ket noi thanh cong
+
+                let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+
+                let result = tokio::select! {
+                    // Nhan lenh tu server
+                    r = handle_incoming(&mut ws_receiver, &tx_control) => r,
+                    // Gui payload len server
+                    r = handle_outgoing(&mut ws_sender, &mut rx_data) => r,
+                };
+
+                match result {
+                    Err(e) => eprintln!("WS error: {}. Dang ket noi lai...", e),
+                    Ok(_) => {}
+                }
+
+                // Mat ket noi: yeu cau worker tam dung
+                let _ = tx_control.send(None);
+            }
+            Err(e) => {
+                eprintln!("Loi ket noi: {}. Thu lai sau {}s...", e, backoff_secs);
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF);
+    }
+}
+
+async fn handle_incoming(
+    ws_receiver: &mut futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+    tx_control: &mpsc::UnboundedSender<Option<(u16, String)>>,
+) -> Result<(), String> {
+    while let Some(msg) = ws_receiver.next().await {
+        match msg {
+            Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                match serde_json::from_str::<ControlCommand>(&text) {
+                    Ok(cmd) => handle_command(cmd, tx_control),
+                    Err(e) => eprintln!("Lenh khong hop le: {} | raw: {}", e, text),
+                }
+            }
+            Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
+                return Err("Server dong ket noi.".to_string());
+            }
+            Err(e) => return Err(e.to_string()),
+            _ => {} // Ping/Pong/Binary: bo qua
+        }
+    }
+    Err("WS stream ket thuc.".to_string())
+}
+
+async fn handle_outgoing(
+    ws_sender: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tokio_tungstenite::tungstenite::Message,
+    >,
+    rx_data: &mut mpsc::UnboundedReceiver<String>,
+) -> Result<(), String> {
+    while let Some(json) = rx_data.recv().await {
+        ws_sender
+            .send(tokio_tungstenite::tungstenite::Message::Text(json))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn handle_command(
+    cmd: ControlCommand,
+    tx_control: &mpsc::UnboundedSender<Option<(u16, String)>>,
+) {
+    match cmd.action.as_str() {
+        "START" => {
+            match (cmd.port, cmd.target) {
+                (Some(port), Some(name)) if port <= u16::MAX as u32 => {
+                    println!("Lenh START: port={} target={}", port, name);
+                    let _ = tx_control.send(Some((port as u16, name)));
+                }
+                _ => eprintln!("START thieu port hoac target."),
+            }
+        }
+        "STOP" => {
+            println!("Lenh STOP.");
+            let _ = tx_control.send(None);
+        }
+        other => eprintln!("Lenh khong ro: {}", other),
+    }
+}
+
+// =============================================================================
+// INSTALL / UNINSTALL
+// =============================================================================
+
+fn install_agent(url: &str) {
+    use std::process::Command;
+
+    println!("Dang cai dat Harbor Agent...");
+
     let _ = Command::new("setx")
         .args(["HARBOR_SERVER_URL", url, "/M"])
         .status();
-
-    // Cập nhật biến môi trường cho phiên làm việc hiện tại của chính nó
     std::env::set_var("HARBOR_SERVER_URL", url);
 
-    let exe_path = std::env::current_exe().expect("Không lấy được đường dẫn exe");
-    let bin_path = format!("\"{}\" run", exe_path.display());
-    
-    // Tạo Service Windows
+    let exe = std::env::current_exe().expect("Khong lay duoc duong dan exe");
+    let bin_path = format!("\"{}\" run", exe.display());
+
     let _ = Command::new("sc")
         .args(["create", "HarborAgent", &format!("binPath= {}", bin_path), "start=", "auto"])
         .status();
-        
     let _ = Command::new("sc")
-        .args(["description", "HarborAgent", "Giám sát hiệu năng Solo Dev Mode"])
+        .args(["description", "HarborAgent", "Harbor Performance Monitor"])
         .status();
-
-    // Khởi động service
     let _ = Command::new("net").args(["start", "HarborAgent"]).status();
 
-    println!("🚀 Cài đặt thành công! Agent đã được đăng ký chạy ngầm cùng Windows.");
+    println!("Cai dat thanh cong. Agent dang chay ngam.");
 }
 
 fn uninstall_agent() {
-    // 1. Dừng và xóa Service
+    use std::process::Command;
+
     let _ = Command::new("net").args(["stop", "HarborAgent"]).status();
     let _ = Command::new("sc").args(["delete", "HarborAgent"]).status();
+    let _ = Command::new("reg").args([
+        "delete",
+        "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
+        "/v", "HARBOR_SERVER_URL",
+        "/f",
+    ]).status();
 
-    // 2. XÓA BIẾN MÔI TRƯỜNG TRONG REGISTRY
-    // Lệnh REG DELETE sẽ xóa tận gốc biến này
-    let _ = Command::new("reg")
-        .args(["delete", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", "/v", "HARBOR_SERVER_URL", "/f"])
-        .status();
-
-    println!("🗑️ Đã gỡ bỏ Harbor Agent và xóa cấu hình Registry sạch sẽ.");
-    println!("⚠️ Lưu ý: Biến môi trường chỉ thực sự biến mất ở phiên làm việc mới.");
+    println!("Da go bo Harbor Agent.");
 }
 
+// =============================================================================
+// SYSTEM HELPERS
+// =============================================================================
 
 pub fn is_admin() -> bool {
     unsafe { IsUserAnAdmin().as_bool() }
@@ -247,14 +351,20 @@ pub fn is_admin() -> bool {
 
 pub fn enable_debug_privilege() -> bool {
     unsafe {
-        let mut h_token = windows::Win32::Foundation::HANDLE::default();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut h_token).is_err() {
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+        .is_err()
+        {
             return false;
         }
 
         let mut luid = windows::Win32::Foundation::LUID::default();
-        let privilege_name: Vec<u16> = "SeDebugPrivilege\0".encode_utf16().collect();
-        if LookupPrivilegeValueW(None, PCWSTR(privilege_name.as_ptr()), &mut luid).is_err() {
+        let name: Vec<u16> = "SeDebugPrivilege\0".encode_utf16().collect();
+        if LookupPrivilegeValueW(None, PCWSTR(name.as_ptr()), &mut luid).is_err() {
             return false;
         }
 
@@ -265,16 +375,7 @@ pub fn enable_debug_privilege() -> bool {
                 Attributes: SE_PRIVILEGE_ENABLED,
             }],
         };
-        
-        println!("👾 Đã kích hoạt leo thang đặc quyền, tiến hành mã hóa máy tính...");
-        AdjustTokenPrivileges(h_token, false, Some(&mut tp), 0, None, None).is_ok()
-    }
-}
-
-fn is_process_alive(handle: windows::Win32::Foundation::HANDLE) -> bool {
-    unsafe {
-        let mut exit_code = 0u32;
-        // 259 = STILL_ACTIVE
-        GetExitCodeProcess(handle, &mut exit_code).is_ok() && exit_code == 259 
+        println!("Đã kích hoạt leo thang đặc quyền, tiến hành mã hóa máy tính...");
+        AdjustTokenPrivileges(token, false, Some(&mut tp), 0, None, None).is_ok()
     }
 }
